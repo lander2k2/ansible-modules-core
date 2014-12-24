@@ -58,7 +58,7 @@ options:
     default: Small
   endpoints:
     description:
-      - a comma-separated list of TCP ports to expose on the virtual machine (e.g., "22,80")
+      - a comma-separated list of TCP ports to expose on the virtual machine (e.g., "22,80"). If you want to change the public port use a pipe-delimited pair in the format "public|local". For example if you want to expose ssh on port 88822, use: "88822|22,80".
     required: false
     default: 22
   user:
@@ -288,11 +288,17 @@ def create_virtual_machine(module, azure):
         network_config.configuration_set_type = 'NetworkConfiguration'
         network_config.subnet_names = []
         network_config.public_ips = None
-        for port in endpoints:
+        for port_pair in endpoints:
+            port_list = port_pair.split('|')
+            port = port_list[0]
+            try:
+                local_port = port_list[1]
+            except IndexError:
+                local_port = port_list[0]
             network_config.input_endpoints.append(ConfigurationSetInputEndpoint(name='TCP-%s' % port,
                                                                                 protocol='TCP',
                                                                                 port=port,
-                                                                                local_port=port))
+                                                                                local_port=local_port))
 
         # First determine where to store disk
         today = datetime.date.today().strftime('%Y-%m-%d')
