@@ -210,6 +210,27 @@ options:
     default: ''
     aliases: []
     version_added: "1.8"
+  restart_policy:
+    description:
+      - Set the container restart policy
+    required: false
+    default: false
+    aliases: []
+    version_added: "1.9"
+  restart_policy_retry:
+    description:
+      - Set the retry limit for container restart policy
+    required: false
+    default: false
+    aliases: []
+    version_added: "1.9"
+  insecure_registry:
+    description:
+      - Use insecure private registry by HTTP instead of HTTPS (needed for docker-py >= 0.5.0).
+    required: false
+    default: false
+    aliases: []
+    version_added: "1.9"
 
 author: Cove Schneider, Joshua Conner, Pavel Antonov
 requirements: [ "docker-py >= 0.3.0", "docker >= 0.10.0" ]
@@ -395,9 +416,62 @@ def get_split_image_tag(image):
 
     return resource, tag
 
-class DockerManager:
+def get_docker_py_versioninfo():
+    if hasattr(docker, '__version__'):
+        # a '__version__' attribute was added to the module but not until
+        # after 0.3.0 was pushed to pypi. If it's there, use it.
+        version = []
+        for part in docker.__version__.split('.'):
+            try:
+                version.append(int(part))
+            except ValueError:
+                for idx, char in enumerate(part):
+                    if not char.isdigit():
+                        nondigit = part[idx:]
+                        digit = part[:idx]
+                if digit:
+                    version.append(int(digit))
+                if nondigit:
+                    version.append(nondigit)
+    elif hasattr(docker.Client, '_get_raw_response_socket'):
+        # HACK: if '__version__' isn't there, we check for the existence of
+        # `_get_raw_response_socket` in the docker.Client class, which was
+        # added in 0.3.0
+        version = (0, 3, 0)
+    else:
+        # This is untrue but this module does not function with a version less
+        # than 0.3.0 so it's okay to lie here.
+        version = (0,)
+
+    return tuple(version)
+
+def check_dependencies(module):
+    """
+    Ensure `docker-py` >= 0.3.0 is installed, and call module.fail_json with a
+    helpful error message if it isn't.
+    """
+    if not HAS_DOCKER_PY:
+        module.fail_json(msg="`docker-py` doesn't seem to be installed, but is required for the Ansible Docker module.")
+    else:
+        versioninfo = get_docker_py_versioninfo()
+        if versioninfo < (0, 3, 0):
+            module.fail_json(msg="The Ansible Docker module requires `docker-py` >= 0.3.0.")
+
+
+class DockerManager(object):
 
     counters = {'created':0, 'started':0, 'stopped':0, 'killed':0, 'removed':0, 'restarted':0, 'pull':0}
+    _capabilities = set()
+    # Map optional parameters to minimum (docker-py version, server APIVersion)
+    # docker-py version is a tuple of ints because we have to compare them
+    # server APIVersion is passed to a docker-py function that takes strings
+    _cap_ver_req = {
+            'dns': ((0, 3, 0), '1.10'),
+            'volume_from': ((0, 3, 0), '1.10'),
+            'restart_policy': ((0, 5, 0), '1.14'),
+            # Clientside only
+            'insecure_registry': ((0, 5, 0), '0.0')
+            }
 
     def __init__(self, module):
         self.module = module
@@ -452,6 +526,46 @@ class DockerManager:
         docker_api_version = module.params.get('docker_api_version')
         self.client = docker.Client(base_url=docker_url.geturl(), version=docker_api_version)
 
+        self.docker_py_versioninfo = get_docker_py_versioninfo()
+
+    def _check_capabilties(self):
+        """
+        Create a list of available capabilities
+        """
+        api_version = self.client.version()['ApiVersion']
+        for cap, req_vers in self._cap_ver_req.items():
+            if (self.docker_py_versioninfo >= req_vers[0] and
+                    docker.utils.compare_version(req_vers[1], api_version) >= 0):
+                self._capabilities.add(cap)
+
+    def ensure_capability(self, capability, fail=True):
+        """
+        Some of the functionality this ansible module implements are only
+        available in newer versions of docker.  Ensure that the capability
+        is available here.
+
+        If fail is set to False then return True or False depending on whether
+        we have the capability.  Otherwise, simply fail and exit the module if
+        we lack the capability.
+        """
+        if not self._capabilities:
+            self._check_capabilties()
+
+        if capability in self._capabilities:
+            return True
+
+        if not fail:
+            return False
+
+        api_version = self.client.version()['ApiVersion']
+        self.module.fail_json(msg='Specifying the `%s` parameter requires'
+                ' docker-py: %s, docker server apiversion %s; found'
+                ' docker-py: %s, server: %s' % (
+                    capability,
+                    '.'.join(self._cap_ver_req[capability][0]),
+                    self._cap_ver_req[capability][1],
+                    '.'.join(self.docker_py_versioninfo),
+                    api_version))
 
     def get_links(self, links):
         """
@@ -614,9 +728,16 @@ class DockerManager:
                   'tty':          self.module.params.get('tty'),
                   }
 
-        if docker.utils.compare_version('1.10', self.client.version()['ApiVersion']) < 0:
-            params['dns'] = self.module.params.get('dns')
-            params['volumes_from'] = self.module.params.get('volumes_from')
+        if params['dns'] is not None:
+            self.ensure_capability('dns')
+
+        if params['volumes_from'] is not None:
+            self.ensure_capability('volumes_from')
+
+        extra_params = {}
+        if self.module.params.get('insecure_registry'):
+            if self.ensure_capability('insecure_registry', fail=False):
+                extra_params['insecure_registry'] = self.module.params.get('insecure_registry')
 
         def do_create(count, params):
             results = []
@@ -643,7 +764,7 @@ class DockerManager:
                 except:
                     self.module.fail_json(msg="failed to login to the remote registry, check your username/password.")
             try:
-                self.client.pull(image, tag=tag)
+                self.client.pull(image, tag=tag, **extra_params)
             except:
                 self.module.fail_json(msg="failed to pull the specified image: %s" % resource)
             self.increment_counter('pull')
@@ -661,9 +782,24 @@ class DockerManager:
             'links': self.links,
             'network_mode': self.module.params.get('net'),
         }
-        if docker.utils.compare_version('1.10', self.client.version()['ApiVersion']) >= 0 and hasattr(docker, '__version__') and docker.__version__ > '0.3.0':
-            params['dns'] = self.module.params.get('dns')
-            params['volumes_from'] = self.module.params.get('volumes_from')
+
+        optionals = []
+        for optional_param in ('dns', 'volumes_from', 'restart_policy', 'restart_policy_retry'):
+            optionals[optional_param] = self.module.params.get(optional_param)
+
+        if optionals['dns'] is not None:
+            self.ensure_capability('dns')
+            params['dns'] = optionals['dns']
+
+        if optionals['volumes_from'] is not None:
+            self.ensure_capability('volumes_from')
+            params['volumes_from'] = optionals['volumes_from']
+
+        if optionals['restart_policy'] is not None:
+            self.ensure_capability('restart_policy')
+            params['restart_policy'] = { 'Name': optionals['restart_policy'] }
+            if params['restart_policy']['Name'] == 'on-failure':
+                params['restart_policy']['MaximumRetryCount'] = optionals['restart_policy_retry']
 
         for i in containers:
             self.client.start(i['Id'], **params)
@@ -692,31 +828,6 @@ class DockerManager:
             self.increment_counter('restarted')
 
 
-def check_dependencies(module):
-    """
-    Ensure `docker-py` >= 0.3.0 is installed, and call module.fail_json with a
-    helpful error message if it isn't.
-    """
-    if not HAS_DOCKER_PY:
-        module.fail_json(msg="`docker-py` doesn't seem to be installed, but is required for the Ansible Docker module.")
-    else:
-        HAS_NEW_ENOUGH_DOCKER_PY = False
-        if hasattr(docker, '__version__'):
-            # a '__version__' attribute was added to the module but not until
-            # after 0.3.0 was added pushed to pip. If it's there, use it.
-            if docker.__version__ >= '0.3.0':
-                HAS_NEW_ENOUGH_DOCKER_PY = True
-        else:
-            # HACK: if '__version__' isn't there, we check for the existence of
-            # `_get_raw_response_socket` in the docker.Client class, which was
-            # added in 0.3.0
-            if hasattr(docker.Client, '_get_raw_response_socket'):
-                HAS_NEW_ENOUGH_DOCKER_PY = True
-
-        if not HAS_NEW_ENOUGH_DOCKER_PY:
-            module.fail_json(msg="The Ansible Docker module requires `docker-py` >= 0.3.0.")
-
-
 def main():
     module = AnsibleModule(
         argument_spec = dict(
@@ -742,13 +853,16 @@ def main():
             dns             = dict(),
             detach          = dict(default=True, type='bool'),
             state           = dict(default='running', choices=['absent', 'present', 'running', 'stopped', 'killed', 'restarted']),
+            restart_policy  = dict(default=None, choices=['always', 'on-failure', 'no']),
+            restart_policy_retry = dict(default=0, type='int'),
             debug           = dict(default=False, type='bool'),
             privileged      = dict(default=False, type='bool'),
             stdin_open      = dict(default=False, type='bool'),
             tty             = dict(default=False, type='bool'),
             lxc_conf        = dict(default=None, type='list'),
             name            = dict(default=None),
-            net             = dict(default=None)
+            net             = dict(default=None),
+            insecure_registry = dict(default=False, type='bool'),
         )
     )
 

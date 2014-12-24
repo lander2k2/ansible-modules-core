@@ -58,7 +58,7 @@ options:
     default: Small
   endpoints:
     description:
-      - a comma-separated list of TCP ports to expose on the virtual machine (e.g., "22,80"). If you want to change the public port use a pipe-delimited pair in the format "public|local". For example if you want to expose ssh on port 88822, use: "88822|22,80".
+      - a comma-separated list of TCP ports to expose on the virtual machine (e.g., "22,80"). If you want to change the public port, use a pipe-delimited pair in the format "public|local". For example if you want to expose ssh on port 88822, use: "88822|22,80".
     required: false
     default: 22
   user:

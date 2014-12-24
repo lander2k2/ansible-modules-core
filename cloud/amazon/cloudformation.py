@@ -60,6 +60,13 @@ options:
     required: true
     default: null
     aliases: []
+  stack_policy:
+    description:
+      - the path of the cloudformation stack policy
+    required: false
+    default: null
+    aliases: []
+    version_added: "x.x"
   tags:
     description:
       - Dictionary of tags to associate with stack and it's resources during stack creation. Cannot be updated later.
@@ -121,13 +128,6 @@ try:
 except ImportError:
     print "failed=True msg='boto required for this module'"
     sys.exit(1)
-
-
-class Region:
-    def __init__(self, region):
-        '''connects boto to the region specified in the cloudformation template'''
-        self.name = region
-        self.endpoint = 'cloudformation.%s.amazonaws.com' % region
 
 
 def boto_exception(err):
@@ -197,6 +197,7 @@ def main():
             template_parameters=dict(required=False, type='dict', default={}),
             state=dict(default='present', choices=['present', 'absent']),
             template=dict(default=None, required=True),
+            stack_policy=dict(default=None, required=False),
             disable_rollback=dict(default=False, type='bool'),
             tags=dict(default=None)
         )
@@ -209,6 +210,10 @@ def main():
     state = module.params['state']
     stack_name = module.params['stack_name']
     template_body = open(module.params['template'], 'r').read()
+    if module.params['stack_policy'] is not None:
+        stack_policy_body = open(module.params['stack_policy'], 'r').read()
+    else:
+        stack_policy_body = None
     disable_rollback = module.params['disable_rollback']
     template_parameters = module.params['template_parameters']
     tags = module.params['tags']
@@ -227,11 +232,10 @@ def main():
     stack_outputs = {}
 
     try:
-        cf_region = Region(region)
-        cfn = boto.cloudformation.connection.CloudFormationConnection(
-                  aws_access_key_id=aws_access_key, 
+        cfn = boto.cloudformation.connect_to_region(
+                  region,
+                  aws_access_key_id=aws_access_key,
                   aws_secret_access_key=aws_secret_key,
-                  region=cf_region,
               )
     except boto.exception.NoAuthHandlerFound, e:
         module.fail_json(msg=str(e))
@@ -245,6 +249,7 @@ def main():
         try:
             cfn.create_stack(stack_name, parameters=template_parameters_tup,
                              template_body=template_body,
+                             stack_policy_body=stack_policy_body,
                              disable_rollback=disable_rollback,
                              capabilities=['CAPABILITY_IAM'],
                              **kwargs)
@@ -265,6 +270,7 @@ def main():
         try:
             cfn.update_stack(stack_name, parameters=template_parameters_tup,
                              template_body=template_body,
+                             stack_policy_body=stack_policy_body,
                              disable_rollback=disable_rollback,
                              capabilities=['CAPABILITY_IAM'])
             operation = 'UPDATE'
